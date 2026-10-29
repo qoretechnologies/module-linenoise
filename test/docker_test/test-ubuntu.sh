@@ -43,4 +43,7 @@ chown -R qore:qore ${MODULE_SRC_DIR}
 # run the tests
 export QORE_MODULE_DIR=${MODULE_SRC_DIR}/qlib:${QORE_MODULE_DIR}
 cd ${MODULE_SRC_DIR}
-# ...
+# the tests run as the qore user; with set -e, a failing test fails the job
+for test in test/*.qtest; do
+    gosu qore:qore qore $test -vv
+done
