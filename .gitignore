@@ -1,6 +1,0 @@
-# ignore emacs backup files
-*~
-
-# ignore	cmake builds
-build/
-build-*/
