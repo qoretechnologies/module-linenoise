@@ -157,6 +157,11 @@ Linenoise::set_callback(\my_callback());
 
     @section linenoisereleasenotes linenoise Module Release Notes
 
+    @subsection linenoise_1_0_2 linenoise Module Version 1.0.2
+    - fixed a deadlock when the completion callback calls a function of this module, such as
+      @ref Qore::Linenoise::history_add() "history_add()", and a crash when it replaces itself with
+      @ref Qore::Linenoise::set_callback() "set_callback()" while it runs
+
     @subsection linenoise_1_0_1 linenoise Module Version 1.0.1
     - updated to build with \c qpp from %Qore 1.12.4+
 
@@ -168,7 +173,9 @@ static QoreNamespace LinenoiseNS("Linenoise");
 
 void init_linenoise_functions(QoreNamespace& ns);
 
-QoreThreadLock lock;
+// the lock is recursive: the completion callback runs in line(), which holds the lock, and can call the functions of
+// this module, which take the lock again
+QoreRecursiveThreadLock lock;
 ResolvedCallReferenceNode* callbackNode = nullptr;
 
 void qore_lineoise_completion_cb(const char *input, linenoiseCompletions *qter) {
@@ -181,11 +188,14 @@ void qore_lineoise_completion_cb(const char *input, linenoiseCompletions *qter) 
 
     ExceptionSink xsink;
 
+    // the callback can replace itself with set_callback() while it runs, which releases the module's reference to it,
+    // so it is called through a reference of its own
+    ReferenceHolder<ResolvedCallReferenceNode> callback(callbackNode->refRefSelf(), &xsink);
     ValueHolder ret(&xsink);
     {
        ReferenceHolder<QoreListNode> args(new QoreListNode(autoTypeInfo), &xsink);
        args->push(new QoreStringNode(input), nullptr);
-       ret = callbackNode->execValue(*args, &xsink);
+       ret = callback->execValue(*args, &xsink);
     }
 
     if (ret->getType() != NT_LIST) {

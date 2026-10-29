@@ -1,0 +1,145 @@
+#!/usr/bin/env qore
+# -*- mode: qore; indent-tabs-mode: nil -*-
+# Copyright (C) 2026 Qore Technologies, s.r.o.
+
+# The completion callback runs in line(), which holds the module lock, so the lock is recursive: a callback that
+# calls a function of this module, such as history_add(), deadlocked.  A callback that replaces itself with
+# set_callback() while it runs keeps running with everything it captured: the module holds a reference to the
+# callback while it calls it.
+#
+# The callback only runs when the line is read from a terminal, so each scenario runs in a terminal that script(1)
+# creates; without script(1), the test is skipped.  The test types the input once the prompt has appeared in the
+# terminal's output, when linenoise reads the terminal in raw mode.  Every wait for the terminal's output is bounded,
+# so a deadlocked scenario fails the test instead of hanging it.
+
+%new-style
+%require-types
+%strict-args
+%enable-all-warnings
+
+%requires QUnit
+%requires Util
+%requires FsUtil
+
+%exec-class LinenoiseCompletionCallbackTest
+
+class LinenoiseCompletionCallbackTest inherits QUnit::Test {
+    public {
+        #! the longest time in milliseconds that the terminal's output can pause before the scenario fails
+        const OutputTimeout = 60000;
+
+        #! the longest time in seconds that a scenario's terminal session can run
+        const SessionTimeout = 120;
+    }
+
+    constructor() : QUnit::Test("linenoise completion callback", "1.0") {
+        addTestCase("the completion callback calls a function of the module", \testHistory());
+        addTestCase("the completion callback replaces itself", \testReplace());
+        set_return_value(main());
+    }
+
+    testHistory() {
+        list<string> lines = runScenario("history");
+        # the line's own history entry is removed when the line ends, which removes the entry that the callback
+        # added (the last one) instead: only the callback's return is checked here
+        assertEq(("start history", "after history_add history"), lines,
+            "the callback called history_add() and returned");
+    }
+
+    testReplace() {
+        list<string> lines = runScenario("replace");
+        assertEq(("start replace", "after replace replace", "destroyed replace"), lines,
+            "the callback was destroyed only after it returned");
+    }
+
+    #! runs the scenario in a terminal, types "ab", Tab and Enter once the prompt is displayed, checks the line read
+    #! (completed by the callback) and returns the other lines of the result
+    private list<string> runScenario(string kind) {
+        if (system("command -v script > /dev/null 2>&1")) {
+            testSkip("script(1) is not available to run the scenario in a terminal");
+        }
+        string qore_bin = ENV.QORE_BIN ?? QORE_ARGV[0] ?? "qore";
+        string scenario = get_script_dir() + DirSep + "CompletionCallbackScenario.q";
+        string dir = make_tmp_dir("linenoise-completion");
+        on_exit remove_tree(dir);
+        string result_path = join_paths(dir, "result.txt");
+        # the terminal's input and output go through named pipes; the test holds both ends of each, so no open waits
+        # for the other end
+        string in_path = join_paths(dir, "in");
+        string out_path = join_paths(dir, "out");
+        if (mkfifo(in_path) || mkfifo(out_path)) {
+            throw "MKFIFO-ERROR", strerror();
+        }
+        File input_pipe();
+        input_pipe.open2(in_path, O_RDWR);
+        on_exit input_pipe.close();
+        File output_pipe();
+        output_pipe.open2(out_path, O_RDWR);
+
+        # the terminal is given a size, so linenoise does not ask the terminal for the cursor position, which nothing
+        # answers
+        string inner = sprintf("stty cols 80 rows 24; TERM=xterm %s %s %s %s", shell_quote(qore_bin),
+            shell_quote(scenario), shell_quote(result_path), shell_quote(kind));
+        # the util-linux and BusyBox script take the command with -c; the session is bounded, so that a deadlocked
+        # scenario ends and the test fails instead of waiting for it
+        string script_cmd = sprintf("timeout %d script -q -c %s /dev/null", SessionTimeout, shell_quote(inner));
+        # the shell opens the named pipe before it starts anything, so the input written to it is never lost; cat
+        # relays it to script(1) and ends when the test closes the input
+        string cmd = sprintf("exec 3< %s > %s 2>&1; (cat <&3 3<&- &) | %s 3<&-", shell_quote(in_path),
+            shell_quote(out_path), script_cmd);
+        # the output has no end of file, since the test holds its write end too: the end of the session is marked in
+        # the output with its exit status, after everything that script(1) wrote, even if system() throws
+        string end_mark = "end of the session " + get_random_string(32);
+        background run_session(cmd, out_path, end_mark);
+
+        string output;
+        bool prompted;
+        *int rc;
+        while (True) {
+            if (!output_pipe.isDataAvailable(OutputTimeout)) {
+                printf("script output so far:\n%s\n", output);
+                throw "SCENARIO-TIMEOUT", sprintf("the %y scenario wrote nothing for %d ms (deadlocked?)", kind,
+                    OutputTimeout);
+            }
+            *binary data = output_pipe.readBinary(1);
+            if (!data) {
+                break;
+            }
+            output += data.toString("ISO-8859-1");
+            # the input is typed once the prompt is displayed: linenoise is then reading the terminal in raw mode
+            if (!prompted && output =~ /callback> /) {
+                prompted = True;
+                input_pipe.write("ab\t\r");
+                input_pipe.close();
+            }
+            *list<string> status = regex_extract(output, "\n" + end_mark + " (-?[0-9]+)\n");
+            if (status) {
+                rc = status[0].toInt();
+                break;
+            }
+        }
+        on_error printf("script output (rc %y):\n%s\n", rc, output);
+        assertEq(0, rc, "the session ended");
+        assertTrue(prompted, "the scenario displayed the prompt in the terminal");
+        assertTrue(is_file(result_path), "the scenario wrote its result");
+        list<string> lines = ReadOnlyFile::readTextFile(result_path).split("\n");
+        assertEq("line=abc", shift lines, "the line read was completed by the callback");
+        return lines;
+    }
+
+    #! runs the session and writes the end mark with its exit status to the output pipe
+    private static run_session(string cmd, string out_path, string end_mark) {
+        int rc = -1;
+        on_exit {
+            File end_pipe();
+            end_pipe.open2(out_path, O_WRONLY);
+            end_pipe.printf("\n%s %d\n", end_mark, rc);
+        }
+        rc = system(cmd);
+    }
+
+    #! returns the string quoted for the shell
+    private static string shell_quote(string str) {
+        return "'" + replace(str, "'", "'\\''") + "'";
+    }
+}

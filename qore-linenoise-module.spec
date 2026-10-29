@@ -5,7 +5,7 @@
 %global user_module_dir %{mydatarootdir}/qore-modules/
 
 Name:           qore-linenoise-module
-Version:        1.0.1
+Version:        1.0.2
 Release:        1
 Summary:        Qorus Integration Engine - Qore linenoise module
 License:        MIT
@@ -66,6 +66,9 @@ make DESTDIR=%{buildroot} install %{?_smp_mflags}
 qore -l ./linenoise-api-1.3.qmod test/linenoise.qtest
 
 %changelog
+* Tue Oct 27 2026 David Nichols <david@qore.org> 1.0.2
+- updated to version 1.0.2
+
 * Mon Dec 19 2022 David Nichols <davie@qore.org> 1.0.1
 - updated to version 1.0.1
 - use cmake for the build
